@@ -1,0 +1,17 @@
+# Python 虚拟环境
+.venv/
+
+# PDF 导出产物
+pdf_output/
+
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Python cache
+__pycache__/
