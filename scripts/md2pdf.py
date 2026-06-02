@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
 """
-md2pdf.py — 一键将 Markdown 导出为 PDF（移动端友好）
+⚠️ DEPRECATED ⚠️ —— 本脚本已废弃，仅保留作为历史记录。
 
-用法:
-    python3 scripts/md2pdf.py chapters/01-flash-sale-crash.md
-    python3 scripts/md2pdf.py chapters/01-flash-sale-crash.md -o output.pdf
-    python3 scripts/md2pdf.py --all
+废弃原因：
+  - 基于 fpdf2 的渲染质量有限（字体 fallback 差、表格固定列宽、无 PDF 大纲）
+  - 中文字体在 .ttc collection 上常缺字（PingFang HK 子字体缺简体常用字）
 
-依赖:
-    pip3 install fpdf2
+替代方案：使用 ~/.claude/skills/md2pdf 全局 skill（pandoc + Chrome headless）
+  典型流程：
+    1. python3 scripts/merge_chapters.py chapters/00-prologue.md chapters/01-flash-sale-crash.md \
+         -o /tmp/h3book_part1.md   # 合并 + 剥离写作元数据 blockquote
+    2. bash ~/.claude/skills/md2pdf/scripts/md2pdf.sh /tmp/h3book_part1.md pdf_output/序幕+第1章.pdf
+
+下次写作时如要导出 PDF，请直接使用上面的方案；若需调用本脚本请先评估是否仍合适。
 """
 
 import sys
@@ -16,6 +20,9 @@ import os
 import re
 import argparse
 from pathlib import Path
+
+print("[md2pdf] ⚠️  此脚本已废弃。请改用 ~/.claude/skills/md2pdf（pandoc + Chrome headless）。", file=sys.stderr)
+print("[md2pdf]    详情见本文件顶部说明。继续运行旧逻辑...", file=sys.stderr)
 
 FPDF = None
 
@@ -318,18 +325,20 @@ class MD2PDF:
                 print("[md2pdf] 警告: 未找到中文字体，将使用内置字体（中文可能显示为方块）")
                 self.body_font = "Helvetica"
         
-        self.pdf.add_page()
-    
+        self._page_started = False
+
     def _find_cjk_font(self):
         """查找系统中可用的中文字体"""
         candidates = [
-            # macOS
+            # macOS：Arial Unicode 是单文件 .ttf，简繁日韩全覆盖，优先选
+            "/Library/Fonts/Arial Unicode.ttf",
+            "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+            # PingFang/STHeiti 是 .ttc collection，fpdf2 取到的子字体可能缺简体常用字，作为备选
             "/System/Library/Fonts/PingFang.ttc",
             "/System/Library/Fonts/Supplemental/PingFang.ttc",
             "/System/Library/Fonts/PingFang SC.ttc",
             "/System/Library/Fonts/STHeiti Light.ttc",
             "/System/Library/Fonts/STHeiti Medium.ttc",
-            "/Library/Fonts/Arial Unicode.ttf",
             # 常见备选
             "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
             "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
@@ -350,15 +359,19 @@ class MD2PDF:
         
         return None
     
-    def render(self, tokens: list, title: str = ""):
+    def render(self, tokens: list, title: str = "", new_page: bool = True):
         p = self.pdf
         F = self.body_font
         L = p.l_margin
         W = p.w - p.l_margin - p.r_margin
-        
+
+        if new_page or not self._page_started:
+            p.add_page()
+            self._page_started = True
+
         # 跟踪上一个 token 类型，用于上下文感知间距
         prev_type = None
-        
+
         for i, token in enumerate(tokens):
             ttype = token[0]
             
@@ -377,19 +390,22 @@ class MD2PDF:
             
             # ── 渲染 ──
             if ttype == "h1":
+                self._add_outline(token[1], 0)
                 p.set_font(F, "B", 16)
                 p.set_x(L)
                 p.multi_cell(W, 8, token[1], align="L")
                 p.line(L, p.get_y() + 0.5, L + W, p.get_y() + 0.5)
                 p.ln(1.5)
-            
+
             elif ttype == "h2":
+                self._add_outline(token[1], 1)
                 p.set_font(F, "B", 13)
                 p.set_x(L)
                 p.multi_cell(W, 6.5, token[1], align="L")
                 p.ln(0.5)
-            
+
             elif ttype == "h3":
+                self._add_outline(token[1], 2)
                 p.set_font(F, "B", 11.5)
                 p.set_x(L)
                 p.multi_cell(W, 6, token[1], align="L")
@@ -479,6 +495,12 @@ class MD2PDF:
     def save(self, path: str):
         self.pdf.output(path)
 
+    def _add_outline(self, name: str, level: int):
+        try:
+            self.pdf.start_section(name, level=level, strict=False)
+        except Exception:
+            pass
+
 
 # ── 主流程 ──────────────────────────────────────
 def convert_file(md_path: str, output_path: str = None, font_path: str = None):
@@ -504,7 +526,8 @@ def convert_file(md_path: str, output_path: str = None, font_path: str = None):
     
     parser = MDParser(md_text)
     tokens = parser.parse()
-    
+    tokens = strip_meta_blockquotes(tokens)
+
     gen = MD2PDF(font_path)
     gen.render(tokens, title)
     gen.save(str(output_path))
@@ -525,21 +548,70 @@ def convert_all(base_dir: str = "chapters", output_dir: str = "pdf_output"):
         convert_file(str(md_path), str(out / pdf_name))
 
 
+def strip_meta_blockquotes(tokens: list) -> list:
+    """跳过 H1 之后紧跟的元数据 blockquote（**所属部** / **主讲** / **本章定位** 等写作脚手架）。
+
+    规则：第一个 H1 之后，遇到的连续 blockquote 与 hr 全部丢弃；遇到任意其他 token 则停止过滤。
+    H1 本身保留。
+    """
+    out = []
+    i = 0
+    seen_h1 = False
+    while i < len(tokens):
+        t = tokens[i]
+        out.append(t)
+        if not seen_h1 and t[0] == "h1":
+            seen_h1 = True
+            i += 1
+            while i < len(tokens) and tokens[i][0] in ("blockquote", "hr"):
+                i += 1
+            continue
+        i += 1
+    return out
+
+
+def convert_files_merged(md_paths: list, output_path: str, font_path: str = None):
+    """合并多个 Markdown 为一个 PDF，每个文件起新页，共享 outline。"""
+    md_paths = [Path(p) for p in md_paths]
+    for mp in md_paths:
+        if not mp.exists():
+            print(f"[md2pdf] 错误: 文件不存在 {mp}")
+            sys.exit(1)
+
+    print(f"[md2pdf] 合并转换 {len(md_paths)} 个文件 → {output_path}")
+    gen = MD2PDF(font_path)
+    for idx, md_path in enumerate(md_paths):
+        with open(md_path, "r", encoding="utf-8") as f:
+            md_text = f.read()
+        tokens = MDParser(md_text).parse()
+        tokens = strip_meta_blockquotes(tokens)
+        print(f"[md2pdf]   {idx+1}/{len(md_paths)}: {md_path.name}")
+        gen.render(tokens, new_page=True)
+    gen.save(output_path)
+    size_kb = Path(output_path).stat().st_size / 1024
+    print(f"[md2pdf] ✅ 完成: {output_path} ({size_kb:.0f} KB)")
+
+
 def main():
     parser = argparse.ArgumentParser(description="md2pdf — Markdown 一键导出 PDF")
-    parser.add_argument("input", nargs="?", help="Markdown 文件路径")
+    parser.add_argument("inputs", nargs="*", help="Markdown 文件路径（可多个，多个时合并为一份 PDF）")
     parser.add_argument("-o", "--output", help="输出 PDF 路径")
     parser.add_argument("--all", action="store_true", help="批量导出 chapters/ 下所有文件")
     parser.add_argument("--outdir", default="pdf_output", help="批量导出目录")
     parser.add_argument("--font", help="指定中文字体路径")
-    
+
     args = parser.parse_args()
     ensure_fpdf2()
-    
+
     if args.all:
         convert_all(output_dir=args.outdir)
-    elif args.input:
-        convert_file(args.input, args.output, args.font)
+    elif len(args.inputs) > 1:
+        if not args.output:
+            print("[md2pdf] 错误: 多文件合并必须用 -o 指定输出路径")
+            sys.exit(1)
+        convert_files_merged(args.inputs, args.output, args.font)
+    elif len(args.inputs) == 1:
+        convert_file(args.inputs[0], args.output, args.font)
     else:
         parser.print_help()
 
